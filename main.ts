@@ -8,8 +8,13 @@
 // exit on a wide hysteresis break (close 1.5% under the slow EMA or 12-bar
 // momentum below -3%) or when a position falls 6% under its cost; rotate
 // and trim only on rebalance bars every 4 bars, with a 150 USDC minimum
-// trade and a 4%-of-equity drift band. No clock, no environment, no random
-// source: the same bars always produce the same replies.
+// trade and a 4%-of-equity drift band. A deterministic minimum-trades
+// safeguard stays inactive before bar 44; from bar 44 on, while fewer than
+// eight orders have filled, it adds one small 60 USDC top-up buy every four
+// bars (or, from bar 60 with no room or cash for a buy, sells a quarter of
+// the largest position), stopping once filled plus pending orders reach
+// nine. No clock, no environment, no random source: the same bars always
+// produce the same replies.
 
 import { createInterface } from 'node:readline';
 
@@ -29,6 +34,11 @@ const EXIT_MOMENTUM = -0.03;
 const STOP_NUM = 94n;
 const STOP_DEN = 100n;
 const BPS_DEN = 10000n;
+const SAFEGUARD_START_SEQ = 44;
+const SAFEGUARD_SELL_SEQ = 60;
+const SAFEGUARD_MIN_TRADES = 8;
+const SAFEGUARD_STOP_TRADES = 9;
+const TOPUP_USDC = 60n;
 
 let hello = null;
 let warmupBars = 0;
@@ -38,6 +48,7 @@ let emaFast = {};
 let emaSlow = {};
 let lastCloseRaw = {};
 let orderCounter = 0;
+let filledCount = 0;
 
 function pow10(n) {
   let r = 1n;
@@ -98,6 +109,11 @@ function nextClientId(seq) {
 
 function decide(batch) {
   const seq = batch.seq;
+  if (batch.fills) {
+    for (const f of batch.fills) {
+      if (f && f.status === 'filled') filledCount += 1;
+    }
+  }
   const present = {};
   for (const bar of batch.bars) {
     const info = symInfo[bar.symbol];
@@ -209,6 +225,79 @@ function decide(batch) {
       boughtNotional[sym] = (boughtNotional[sym] || 0n) + buy;
       cashLeft -= buy;
       if (held === 0n) newBuys += 1;
+    }
+  }
+
+  // Minimum-trades safeguard: inactive before bar 44 and whenever eight
+  // orders have already filled. It only appends orders after the core
+  // logic above, one per four-bar opportunity, and stops once filled plus
+  // this bar's pending orders reach nine.
+  if (
+    seq >= SAFEGUARD_START_SEQ &&
+    seq % REBAL_EVERY === 0 &&
+    filledCount < SAFEGUARD_MIN_TRADES &&
+    filledCount + orders.length < SAFEGUARD_STOP_TRADES &&
+    orders.length < maxOrders
+  ) {
+    const topUp = TOPUP_USDC * pow10(hello.capital.quote_scale);
+    function buyRoom(sym) {
+      const held = heldQty[sym] || 0n;
+      const heldValue = held > 0n ? valueQuote(held, lastCloseRaw[sym], symInfo[sym]) : 0n;
+      return weightCap - heldValue - (boughtNotional[sym] || 0n);
+    }
+    function canTopUp(sym) {
+      if (!present[sym] || soldQty[sym]) return false;
+      if (cashLeft < topUp || topUp < minNotional) return false;
+      if (buyRoom(sym) < topUp) return false;
+      const held = heldQty[sym] || 0n;
+      if (held === 0n && openCount + newBuys >= maxOpen) return false;
+      return true;
+    }
+    function byMomentumDesc(a, b) {
+      const ma = momentumN(a, MOM_N);
+      const mb = momentumN(b, MOM_N);
+      const va = ma === null ? -Infinity : ma;
+      const vb = mb === null ? -Infinity : mb;
+      if (vb !== va) return vb - va;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }
+    const eligibleRanked = Object.keys(symInfo).filter((s) => present[s] && isEligible(s)).sort(byMomentumDesc);
+    const momentumRanked = Object.keys(symInfo).filter((s) => present[s]).sort(byMomentumDesc);
+    let pick = null;
+    for (const sym of eligibleRanked) {
+      if (canTopUp(sym)) { pick = sym; break; }
+    }
+    if (pick === null) {
+      for (const sym of momentumRanked) {
+        if (canTopUp(sym)) { pick = sym; break; }
+      }
+    }
+    if (pick !== null) {
+      const held = heldQty[pick] || 0n;
+      orders.push({ side: 'buy', client_id: nextClientId(seq), symbol: pick, notional_quote_units: topUp.toString(), max_slippage_bps: MAX_SLIPPAGE_BPS });
+      boughtNotional[pick] = (boughtNotional[pick] || 0n) + topUp;
+      cashLeft -= topUp;
+      if (held === 0n) newBuys += 1;
+    } else if (seq >= SAFEGUARD_SELL_SEQ) {
+      let bestSym = null;
+      let bestValue = -1n;
+      let bestQty = 0n;
+      for (const sym of heldSyms) {
+        if (!present[sym]) continue;
+        const remaining = heldQty[sym] - (soldQty[sym] || 0n);
+        if (remaining <= 0n) continue;
+        const value = valueQuote(remaining, lastCloseRaw[sym], symInfo[sym]);
+        if (value > bestValue) {
+          bestValue = value;
+          bestSym = sym;
+          bestQty = remaining;
+        }
+      }
+      if (bestSym !== null) {
+        let sellQty = bestQty / 4n;
+        if (sellQty > 0n && valueQuote(sellQty, lastCloseRaw[bestSym], symInfo[bestSym]) < minNotional) sellQty = bestQty;
+        if (sellQty > 0n) pushSell(bestSym, sellQty);
+      }
     }
   }
 
